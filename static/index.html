@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warcraft III — VR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05070c; color: #cfd8e3;
+               font-family: system-ui, sans-serif; overflow: hidden; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; padding: 14px 18px;
+         background: linear-gradient(transparent, rgba(0,0,0,.75));
+         display: flex; flex-wrap: wrap; gap: 10px; align-items: center; z-index: 10; }
+  #hud .grow { flex: 1; min-width: 180px; font-size: 13px; opacity: .85; line-height: 1.5; }
+  button { background: #17233a; color: #e6eefc; border: 1px solid #2d4468;
+           border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+  button.on { background: #2d4468; border-color: #5b83c0; }
+  #enterVR { background: #7a5c16; border-color: #c9a13c; font-weight: 700; font-size: 16px; }
+  #enterVR:disabled { opacity: .45; cursor: default; }
+  #title { position: fixed; top: 12px; left: 18px; z-index: 10; font-size: 14px;
+           letter-spacing: .12em; text-transform: uppercase; opacity: .7; }
+</style>
+</head>
+<body>
+<div id="title">Warcraft III &middot; VR 360</div>
+<div id="hud">
+  <div class="grow" id="status">Подключение к стриму&hellip;</div>
+  <button data-preset="theater">Кинотеатр 110&deg;</button>
+  <button data-preset="panorama" class="on">Панорама 180&deg;</button>
+  <button data-preset="dome">Купол 250&deg;</button>
+  <button id="camsync" title="Поворот головы крутит камеру в игре (Insert/Delete/PageUp/Down). Только одиночная игра!">Камера игры: ВЫКЛ</button>
+  <button id="enterVR" disabled>ВОЙТИ В VR</button>
+</div>
+
+<script type="module">
+import * as THREE from './three.module.min.js';
+
+const PRESETS = {
+  theater:  { wrap: 110 * Math.PI / 180, radius: 3.4 },
+  panorama: { wrap: 180 * Math.PI / 180, radius: 2.8 },
+  dome:     { wrap: 250 * Math.PI / 180, radius: 2.4 },
+};
+let preset = localStorage.getItem('wc3vr-preset') || 'panorama';
+if (!PRESETS[preset]) preset = 'panorama';
+
+// калибровка указателя (если курсор зеркалит — поменяй на true):
+const INVERT_PX = false;   // горизонталь
+const INVERT_PY = false;   // вертикаль
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 200);
+camera.position.set(0, 1.6, 0);
+const cameraRig = new THREE.Group();
+cameraRig.add(camera);
+scene.add(cameraRig);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x05070c);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.appendChild(renderer.domElement);
+
+// --- окружение: пусто (звёзды, пол и сетка убраны — ничего не мешает обзору) ---
+// вокруг экрана только ровный тёмный фон (цвет очистки рендера)
+
+// --- изогнутый экран ---
+const texture = new THREE.Texture();
+texture.colorSpace = THREE.SRGBColorSpace;
+texture.flipY = false;
+texture.wrapS = THREE.RepeatWrapping;
+texture.repeat.x = -1;
+texture.offset.x = 1;
+texture.minFilter = THREE.LinearFilter;
+texture.generateMipmaps = false;
+
+let screenMesh = null;
+let aspect = 16 / 9;
+let screenBaseY = 1.6;
+
+function buildScreen() {
+  if (screenMesh) { scene.remove(screenMesh); screenMesh.geometry.dispose(); }
+  const { wrap, radius } = PRESETS[preset];
+  const height = Math.min((radius * wrap) / aspect, 8);
+  const geo = new THREE.CylinderGeometry(radius, radius, height, 72, 1, true,
+                                         Math.PI - wrap / 2, wrap);
+  const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide,
+                                            fog: false, toneMapped: false });
+  screenMesh = new THREE.Mesh(geo, mat);
+  // в режиме «первое лицо» экран центрируется на голове (см. цикл рендера),
+  // поэтому центр экрана держим на уровне глаз, а не приподнятым
+  screenBaseY = Math.max(1.6, height / 2 - 0.2);
+  screenMesh.position.y = screenBaseY;
+  scene.add(screenMesh);
+}
+buildScreen();
+
+// --- приём MJPEG-потока через fetch ---
+const statusEl = document.getElementById('status');
+let frames = 0, streamFps = 0;
+setInterval(() => { streamFps = frames; frames = 0; }, 1000);
+
+async function connectStream() {
+  try {
+    const resp = await fetch('/stream');
+    const reader = resp.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf); merged.set(value, buf.length);
+      buf = merged;
+      for (;;) {
+        const headEnd = indexOfSeq(buf, [13,10,13,10]);          // \r\n\r\n
+        if (headEnd < 0) break;
+        const head = new TextDecoder().decode(buf.subarray(0, headEnd));
+        const m = head.match(/Content-Length:\s*(\d+)/i);
+        if (!m) { buf = buf.subarray(headEnd + 4); continue; }
+        const len = +m[1], total = headEnd + 4 + len;
+        if (buf.length < total) break;
+        const jpeg = buf.subarray(headEnd + 4, total);
+        buf = buf.subarray(total + 2);                            // + \r\n
+        onFrame(new Blob([jpeg], { type: 'image/jpeg' }));
+      }
+    }
+  } catch (e) { /* переподключение ниже */ }
+  statusEl.textContent = 'Стрим оборвался, переподключение…';
+  setTimeout(connectStream, 1000);
+}
+
+function indexOfSeq(a, seq) {
+  outer: for (let i = 0; i <= a.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (a[i+j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+let busy = false;
+async function onFrame(blob) {
+  if (busy) return;          // не копим очередь — берём самый свежий
+  busy = true;
+  try {
+    const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+    const newAspect = bmp.width / bmp.height;
+    if (Math.abs(newAspect - aspect) > 0.01) { aspect = newAspect; buildScreen(); }
+    if (texture.image && texture.image.close) texture.image.close();
+    texture.image = bmp;
+    texture.needsUpdate = true;
+    frames++;
+  } finally { busy = false; }
+}
+connectStream();
+
+// --- статус с сервера ---
+async function pollStatus() {
+  try {
+    const s = await (await fetch('/status')).json();
+    let cam = '';
+    if (s.camsync && s.camsync.enabled) {
+      cam = s.camsync.attached ? ' &middot; <b style="color:#8fd18f">камера: синхр.</b>'
+                               : ` &middot; <b style="color:#d1a08f">камера: ${s.camsync.error || 'жду игру'}</b>`;
+    }
+    statusEl.innerHTML =
+      `Источник: <b>${s.source}</b> &middot; ${s.width}&times;${s.height}` +
+      ` &middot; сервер ${s.fps} fps &middot; приём ${streamFps} fps` + cam;
+  } catch { statusEl.textContent = 'Нет связи с сервером…'; }
+  setTimeout(pollStatus, 2000);
+}
+pollStatus();
+
+// --- синхронизация камеры игры с головой ---
+let camsyncOn = false;
+const camsyncBtn = document.getElementById('camsync');
+camsyncBtn.onclick = async () => {
+  camsyncOn = !camsyncOn;
+  camsyncBtn.textContent = 'Камера игры: ' + (camsyncOn ? 'ВКЛ' : 'ВЫКЛ');
+  camsyncBtn.classList.toggle('on', camsyncOn);
+  if (camsyncOn) needNeutral = true;   // «прямо» = текущее направление головы
+  try { await fetch('/camsync', { method: 'POST', body: JSON.stringify({ on: camsyncOn }) }); }
+  catch {}
+};
+
+const _q = new THREE.Quaternion(), _e = new THREE.Euler();
+const _p = new THREE.Vector3(), _sq = new THREE.Quaternion();
+let lastPoseT = 0, screenYaw = 0;
+let neutralYaw = 0, neutralPitch = 0, needNeutral = false;
+function angDelta(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
+
+function sendPose(yaw, pitch, mx, my, t) {
+  if (t - lastPoseT < 33) return;
+  lastPoseT = t;
+  fetch('/pose', { method: 'POST', body: JSON.stringify({ yaw, pitch, mx, my }) }).catch(() => {});
+}
+
+// стики контроллеров (перемещение камеры): берём стик с большим отклонением
+function readSticks() {
+  let mx = 0, my = 0;
+  const s = renderer.xr.getSession && renderer.xr.getSession();
+  if (s) for (const src of s.inputSources) {
+    const gp = src.gamepad;
+    if (!gp || gp.axes.length < 4) continue;
+    const ax = gp.axes[2], ay = gp.axes[3];
+    if (Math.hypot(ax, ay) > Math.hypot(mx, my)) { mx = ax; my = ay; }
+  }
+  return [mx, my];
+}
+
+// --- кнопки пресетов ---
+document.querySelectorAll('[data-preset]').forEach(btn => {
+  btn.classList.toggle('on', btn.dataset.preset === preset);
+  btn.onclick = () => {
+    preset = btn.dataset.preset;
+    localStorage.setItem('wc3vr-preset', preset);
+    document.querySelectorAll('[data-preset]').forEach(b =>
+      b.classList.toggle('on', b === btn));
+    buildScreen();
+  };
+});
+
+// --- кнопка VR ---
+const enterBtn = document.getElementById('enterVR');
+if (navigator.xr) {
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+    if (ok) { enterBtn.disabled = false; }
+    else { enterBtn.textContent = 'VR НЕДОСТУПЕН'; }
+  });
+} else {
+  enterBtn.textContent = 'НЕТ WebXR (открой на Quest)';
+}
+enterBtn.onclick = async () => {
+  const session = await navigator.xr.requestSession('immersive-vr',
+    { optionalFeatures: ['local-floor'] });
+  session.addEventListener('end', () => { enterBtn.textContent = 'ВОЙТИ В VR'; });
+  await renderer.xr.setSession(session);
+  enterBtn.textContent = 'В VR…';
+  if (camsyncOn) needNeutral = true;   // центр = куда смотришь при входе в VR
+};
+
+// --- обзор мышью для предпросмотра на ПК ---
+let dragging = false, yaw = 0, pitch = 0;
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; });
+addEventListener('pointerup', () => dragging = false);
+addEventListener('pointermove', e => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  yaw   -= e.movementX * 0.004;
+  pitch  = Math.max(-1.4, Math.min(1.4, pitch - e.movementY * 0.004));
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// --- контроллеры VR: лазер-указатель -> курсор игры, триггер=ЛКМ, grip=ПКМ ---
+const raycaster = new THREE.Raycaster();
+const tmpMat = new THREE.Matrix4();
+const controllers = [];
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.addEventListener('connected', e => { c.userData.gp = e.data.gamepad; });
+  c.addEventListener('disconnected', () => { c.userData.gp = null; });
+  const lg = new THREE.BufferGeometry().setFromPoints(
+    [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+  const laser = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0x66ccff }));
+  laser.name = 'laser'; laser.scale.z = 3; c.add(laser);
+  cameraRig.add(c);
+  controllers.push(c);
+}
+const dot = new THREE.Mesh(
+  new THREE.SphereGeometry(0.025, 12, 12),
+  new THREE.MeshBasicMaterial({ color: 0xffcc33, depthTest: false }));
+dot.renderOrder = 999; dot.visible = false; scene.add(dot);
+
+let lastInputT = 0, pLeft = false, pRight = false, wasActive = false;
+function sendInput(o) { fetch('/input', { method: 'POST', body: JSON.stringify(o) }).catch(() => {}); }
+function updatePointer(t) {
+  const on = camsyncOn && renderer.xr.isPresenting && screenMesh;
+  if (!on) {
+    dot.visible = false;
+    if (wasActive) { wasActive = false; pLeft = pRight = false; sendInput({ active: false }); }
+    return;
+  }
+  let best = null, bestGp = null;
+  for (const c of controllers) {
+    const laser = c.getObjectByName('laser');
+    if (!c.userData.gp) { if (laser) laser.scale.z = 3; continue; }
+    tmpMat.identity().extractRotation(c.matrixWorld);
+    raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
+    raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat);
+    const hit = raycaster.intersectObject(screenMesh, false)[0];
+    if (hit) {
+      if (laser) laser.scale.z = hit.distance;
+      if (!best || hit.distance < best.distance) { best = hit; bestGp = c.userData.gp; }
+    } else if (laser) laser.scale.z = 3;
+  }
+  if (!best) {
+    dot.visible = false;
+    if (pLeft || pRight) { pLeft = pRight = false; sendInput({ active: true, nx: 0.5, ny: 0.5, left: false, right: false }); }
+    return;
+  }
+  dot.position.copy(best.point); dot.visible = true;
+  let nx = INVERT_PX ? best.uv.x : 1 - best.uv.x;
+  let ny = INVERT_PY ? best.uv.y : 1 - best.uv.y;
+  nx = Math.min(1, Math.max(0, nx)); ny = Math.min(1, Math.max(0, ny));
+  const left  = !!(bestGp.buttons[0] && bestGp.buttons[0].pressed);   // триггер -> ЛКМ
+  const right = !!(bestGp.buttons[1] && bestGp.buttons[1].pressed);   // grip    -> ПКМ
+  wasActive = true;
+  if (t - lastInputT < 40 && left === pLeft && right === pRight) return;  // не спамим
+  lastInputT = t; pLeft = left; pRight = right;
+  sendInput({ active: true, nx, ny, left, right });
+}
+
+renderer.setAnimationLoop((t) => {
+  if (camsyncOn) {
+    camera.getWorldQuaternion(_q);
+    _e.setFromQuaternion(_q, 'YXZ');
+    if (needNeutral) {
+      neutralYaw = _e.y; neutralPitch = _e.x; needNeutral = false;
+      fetch('/recenter', { method: 'POST' }).catch(() => {});   // камера = «прямо»
+    }
+    // угол головы ОТНОСИТЕЛЬНО «прямо» задаёт направление взгляда игровой
+    // камеры; стик контроллера — перемещение (вперёд/вбок в направлении взгляда)
+    const [mvx, mvy] = readSticks();
+    sendPose(angDelta(_e.y - neutralYaw), _e.x - neutralPitch, mvx, mvy, t);
+  }
+  // экран:
+  //  • режим камеры игры (первое лицо) — экран ЗАКРЕПЛЁН ЗА ГОЛОВОЙ: центрируется
+  //    на голове и повторяет её ориентацию, поэтому едет вместе со зрителем и
+  //    всегда перед лицом (голова крутит игровую камеру, а картинка — на месте);
+  //  • иначе — экран зафиксирован в мире (смотришь на большой изогнутый экран).
+  if (screenMesh) {
+    if (camsyncOn) {
+      camera.getWorldPosition(_p);
+      camera.getWorldQuaternion(_sq);
+      screenMesh.position.copy(_p);
+      screenMesh.quaternion.copy(_sq);
+    } else {
+      screenYaw += angDelta(0 - screenYaw) * 0.12;
+      screenMesh.rotation.set(0, screenYaw, 0);
+      screenMesh.position.set(0, screenBaseY, 0);
+    }
+  }
+  updatePointer(t);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
