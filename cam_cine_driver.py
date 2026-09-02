@@ -28,11 +28,13 @@ CONTAINER_ADDR=GDLL_BASE+0xab4f80      # [это] -> container; camera=[containe
 CAM_OFF=0x254
 SETFIELD=GDLL_BASE+0x305a60            # FUN_6f305a60 (поле камеры)
 SETPOS=GDLL_BASE+0x3078b0              # FUN_6f3078b0 (позиция цели камеры x,y)
+VIEWBUILD=GDLL_BASE+0x3063d0           # FUN_6f3063d0 (покадровая сборка вида, главный поток)
 OFF_ROT=0x5b8; OFF_AOA=0x5b4; OFF_DIST=0x5b0
 OFF_TGTX=0x5a4; OFF_TGTY=0x5a8
 # границы цели камеры (прямоугольник карты), заполняются игрой:
 OFF_BND_MINX=0x4cc; OFF_BND_MINY=0x4d0; OFF_BND_MAXX=0x4d4; OFF_BND_MAXY=0x4d8
-BND_MARGIN=128.0                 # отступ от границы, чтобы не крашить
+BND_MARGIN=128.0                 # отступ ГЛАЗА от границы карты
+OFF_MAP_MARGIN=4000.0            # насколько ЦЕЛЬ может уходить ЗА карту (плавный край, без резкого отъезда)
 
 # ------------------------- настройки -------------------------
 INVERT_YAW=False
@@ -51,13 +53,20 @@ FIXED_EYE=True                   # True = глаз неподвижен, мен�
 # => игра ставит глаз ровно в ту же точку, меняется только направление.
 EYE_HEIGHT=1400.0                # высота глаза над землёй (= «зум»: больше -> дальше;
                                  # нейтральная дистанция = EYE_HEIGHT/sin(NEUTRAL_E) ~2180)
-NEUTRAL_E=40.0                   # нейтральный угол взгляда вниз (град)
+NEUTRAL_E=58.0                   # нейтральный угол взгляда вниз (град) — обзор карты «стоя»
 E_MIN=-45.0; E_MAX=84.0          # угол взгляда вниз; <0 = выше горизонта (в WC3 там
                                  # пусто/чёрно — движок не рисует небо в melee-картах)
 FARZ_VALUE=10000.0               # дальность прорисовки (горизонт дальше)
-MOVE_SPEED=1600.0                # перемещение джойстиком (юниты/сек)
+SETPOS_EVERY=2                   # SetPos (позиция цели) раз в N кадров (сетка не любит частого)
+MOVE_SPEED=1100.0                # перемещение джойстиком (юниты/сек) — мягче панорама
+HEAD_SMOOTH=0.25                 # сглаживание позы головы (0..1; меньше = плавнее, но с лагом)
 MOVE_DEADZONE=0.15               # мёртвая зона стика
-TICK_MS=8                        # период потока в игре (мс)
+MOVE_SMOOTH=0.10                 # плавность разгона/торможения стика (0..1; меньше = плавнее)
+# позиционный трекинг головы (ходьба/наклон/присед в игровой зоне -> камера)
+POS_SCALE_XY=900.0               # игровых юнитов на 1 м шага/наклона вбок
+POS_SCALE_Z=1500.0               # юнитов на 1 м приседа/подъёма (присел = ближе к полю)
+EYE_HEIGHT_MIN=250.0; EYE_HEIGHT_MAX=4500.0
+TICK_MS=16                       # период потока в игре (мс) - реже вызовы, меньше гонки
 WRITE_HZ=90
 # --------------------------------------------------------------
 
@@ -82,7 +91,12 @@ class CineCameraSync:
         self._eye_x=None; self._eye_y=None
         self._TGTX=None; self._TGTY=None; self._FARZ=None; self._ZOFF=None
         self._bnd=None                   # (minx,miny,maxx,maxy) цели камеры
+        self._hook_orig=None             # оригинальные 6 байт пролога FUN_6f3063d0
         self._move=(0.0,0.0)             # стик джойстика (mx=вбок, my=вперёд/назад)
+        self._move_s=(0.0,0.0)           # сглаженная скорость стика
+        self._head=(0.0,0.0,0.0)         # смещение головы (вперёд, вправо, вверх), м
+        self._eye_height=EYE_HEIGHT      # высота/дистанция камеры (наст. ползунком)
+        self._neutral_e=NEUTRAL_E        # угол обзора (наст. ползунком)
         self._last_error=""
         threading.Thread(target=self._loop,daemon=True).start()
 
@@ -102,7 +116,7 @@ class CineCameraSync:
                 tx=self._rf(cam+OFF_TGTX); ty=self._rf(cam+OFF_TGTY)
                 if tx is not None and ty is not None:
                     # глаз ПОЗАДИ цели по направлению взгляда (камера смотрит от глаза на цель)
-                    d0=EYE_HEIGHT/math.tan(math.radians(NEUTRAL_E))
+                    d0=self._eye_height/math.tan(math.radians(self._neutral_e))
                     rr=math.radians(self._neutral_rot_deg)
                     self._eye_x=tx-d0*math.cos(rr)
                     self._eye_y=ty-d0*math.sin(rr)
@@ -120,7 +134,8 @@ class CineCameraSync:
     def status(self):
         return {"enabled":self._enabled,"attached":self._ph is not None,
                 "mode":"cinematic free-cam","installed":self._thread_installed,
-                "error":self._last_error}
+                "error":self._last_error,
+                "eye_height":round(self._eye_height),"neutral_e":round(self._neutral_e)}
 
     # ---------- память ----------
     def _find_hwnd(self):
@@ -138,6 +153,8 @@ class CineCameraSync:
         if user32.GetForegroundWindow()!=h:
             user32.SetForegroundWindow(h)
     def _detach(self):
+        try: self._uninstall_hook()
+        except Exception: pass
         if self._ph:
             try: kernel32.CloseHandle(self._ph)
             except Exception: pass
@@ -185,6 +202,14 @@ class CineCameraSync:
         cam=self._rdw(cont+CAM_OFF)
         return cam if cam and 0x10000<cam<0x7fff0000 else None
 
+    def _camera_valid(self):
+        """Камера жива? (указатель в диапазоне И поле дистанции — нормальный float).
+        Отсекает освобождённый/полусобранный объект при смене состояния игры."""
+        cam=self._camera()
+        if not cam: return False
+        d=self._rf(cam+OFF_DIST)
+        return d is not None and math.isfinite(d) and 0.5<=d<131072.0
+
     def _attach(self):
         pid=self._find_pid()
         if not pid: self._last_error="окно 1.26 не найдено"; return False
@@ -199,44 +224,66 @@ class CineCameraSync:
         self._ph=ph; self._gb=gb; self._pid=pid; self._last_error=""
         return True
 
-    def _install_thread(self):
-        pid=self._find_pid()
-        kbase=self._module_base(pid,b"kernel32.dll")
-        SLEEP=self._get_export(kbase,b"Sleep") if kbase else None
-        if not SLEEP:
-            self._last_error="не резолвится Sleep из kernel32 игры"; return False
+    def _install_hook(self):
+        # ИНЛАЙН-ХУК покадровой функции сборки вида (FUN_6f3063d0, ГЛАВНЫЙ поток):
+        # применяем поля камеры (в т.ч. позицию цели через SetPos) на главном потоке
+        # игры — тогда пространственную сетку меняет только сама игра, по очереди,
+        # без гонки -> нет порванных указателей -> нет краша/зависания.
         cave=int(kernel32.VirtualAllocEx(self._ph,None,0x1000,0x3000,0x40))
+        if not cave:
+            self._last_error="VirtualAllocEx fail"; return False
         ENABLE=cave+0x200; ROT=cave+0x204; AOA=cave+0x208; DIST=cave+0x20c
-        TGTX=cave+0x210; TGTY=cave+0x214; FARZ=cave+0x218; ZOFF=cave+0x21c
+        TGTX=cave+0x210; TGTY=cave+0x214; FARZ=cave+0x218; ZOFF=cave+0x21c; REENTRY=cave+0x220
         P=lambda x: struct.pack("<I",x)
-        # ---- ассемблируем цикл (jz near rel32 под большой блок) ----
-        code=bytearray(); jz_sites=[]
+        code=bytearray(); done_sites=[]; orig_sites=[]
         def emit(b): code.extend(b)
-        # loop (offset 0):
-        emit(b"\xA1"+P(ENABLE)); emit(b"\x85\xC0")
-        emit(b"\x0F\x84\x00\x00\x00\x00"); jz_sites.append(len(code)-4)  # jz near Lsleep
+        # --- защита от рекурсии (SetPos может пере-войти в FUN_6f3063d0) ---
+        emit(b"\x83\x3D"+P(REENTRY)+b"\x00")               # cmp dword[REENTRY],0
+        emit(b"\x0F\x85\x00\x00\x00\x00"); orig_sites.append(len(code)-4)   # jne L_orig
+        emit(b"\xC7\x05"+P(REENTRY)+P(1))                  # mov dword[REENTRY],1
+        emit(b"\x9C\x60")                                  # pushfd; pushad
+        emit(b"\xA1"+P(ENABLE)); emit(b"\x85\xC0")         # mov eax,[ENABLE]; test
+        emit(b"\x0F\x84\x00\x00\x00\x00"); done_sites.append(len(code)-4)   # je L_done
         emit(b"\xA1"+P(CONTAINER_ADDR)); emit(b"\x85\xC0")
-        emit(b"\x0F\x84\x00\x00\x00\x00"); jz_sites.append(len(code)-4)
-        emit(b"\x8B\x80"+P(CAM_OFF)); emit(b"\x85\xC0")
-        emit(b"\x0F\x84\x00\x00\x00\x00"); jz_sites.append(len(code)-4)
-        emit(b"\x8B\xF0")                                  # mov esi,eax (cam)
+        emit(b"\x0F\x84\x00\x00\x00\x00"); done_sites.append(len(code)-4)
+        emit(b"\x8B\x80"+P(CAM_OFF)); emit(b"\x85\xC0")    # mov eax,[eax+0x254]; test
+        emit(b"\x0F\x84\x00\x00\x00\x00"); done_sites.append(len(code)-4)
+        emit(b"\x3D"+P(0x00100000))                        # cmp eax,0x100000
+        emit(b"\x0F\x82\x00\x00\x00\x00"); done_sites.append(len(code)-4)   # jb
+        emit(b"\x3D"+P(0x7F000000))
+        emit(b"\x0F\x83\x00\x00\x00\x00"); done_sites.append(len(code)-4)   # jae
+        emit(b"\x8B\xF0")                                  # mov esi,eax
+        emit(b"\x8B\x96"+P(OFF_DIST))                      # mov edx,[esi+dist]
+        emit(b"\x81\xFA"+P(0x3F000000))
+        emit(b"\x0F\x82\x00\x00\x00\x00"); done_sites.append(len(code)-4)   # jb
+        emit(b"\x81\xFA"+P(0x48000000))
+        emit(b"\x0F\x83\x00\x00\x00\x00"); done_sites.append(len(code)-4)   # jae
         def setfield(field, gaddr):
             emit(b"\x8B\xDC"+b"\x6A\x01"+b"\x68\x00\x00\x00\x00"+b"\xFF\x35"+P(gaddr)
                  +b"\x6A"+struct.pack("<b",field)+b"\x8B\xCE"+b"\xB8"+P(SETFIELD)+b"\xFF\xD0"+b"\x8B\xE3")
         setfield(5,ROT); setfield(2,AOA); setfield(0,DIST); setfield(1,FARZ); setfield(6,ZOFF)
         if FIXED_EYE:
-            # FUN_6f3078b0(this=cam)(x,y): push y; push x; mov ecx,esi; call
+            COUNTER=cave+0x224; mask=max(1,SETPOS_EVERY)-1
+            emit(b"\xFF\x05"+P(COUNTER))                   # inc dword[COUNTER]
+            emit(b"\xA1"+P(COUNTER))                       # mov eax,[COUNTER]
+            emit(b"\x25"+P(mask))                          # and eax,mask
+            emit(b"\x0F\x85\x00\x00\x00\x00"); sk=len(code)-4   # jnz skip_setpos
             emit(b"\x8B\xDC"+b"\xFF\x35"+P(TGTY)+b"\xFF\x35"+P(TGTX)+b"\x8B\xCE"
                  +b"\xB8"+P(SETPOS)+b"\xFF\xD0"+b"\x8B\xE3")
-        # Lsleep:
-        Lsleep=len(code)
-        emit(b"\x6A"+struct.pack("<b",TICK_MS)+b"\xB8"+P(SLEEP)+b"\xFF\xD0")
-        emit(b"\xE9"+struct.pack("<i",0-(len(code)+5)))    # jmp loop
-        for s in jz_sites:
-            code[s:s+4]=struct.pack("<i",Lsleep-(s+4))
+            code[sk:sk+4]=struct.pack("<i",len(code)-(sk+4))   # skip_setpos:
+        Ldone=len(code)
+        emit(b"\x61\x9D")                                  # popad; popfd
+        emit(b"\xC7\x05"+P(REENTRY)+P(0))                  # mov dword[REENTRY],0
+        Lorig=len(code)
+        emit(b"\x81\xEC"+P(0xB4))                          # sub esp,0xB4  (ориг. инстр. #1)
+        emit(b"\xE9"+struct.pack("<i",(VIEWBUILD+6)-(cave+len(code)+5)))    # jmp VIEWBUILD+6
+        for st in done_sites: code[st:st+4]=struct.pack("<i",Ldone-(st+4))
+        for st in orig_sites: code[st:st+4]=struct.pack("<i",Lorig-(st+4))
+        # сначала код+глобали, потом патч точки входа
         self._w(cave, bytes(code))
         self._cave,self._ENABLE,self._ROT,self._AOA,self._DIST=cave,ENABLE,ROT,AOA,DIST
         self._TGTX,self._TGTY,self._FARZ,self._ZOFF=TGTX,TGTY,FARZ,ZOFF
+        self._wdw(REENTRY,0); self._wdw(cave+0x224,0)
         self.recenter()
         self._wdw(ENABLE,0)
         self._wf(FARZ,FARZ_VALUE); self._wf(ZOFF,0.0)
@@ -244,16 +291,36 @@ class CineCameraSync:
             self._write_view(0.0,0.0)
         else:
             self._wf(ROT,self._neutral_rot_deg); self._wf(AOA,self._neutral_aoa_deg); self._wf(DIST,DIST_DEFAULT)
-        tid=wt.DWORD()
-        th=kernel32.CreateRemoteThread(self._ph,None,0,ctypes.c_void_p(cave),ctypes.c_void_p(0),0,ctypes.byref(tid))
-        if not th: self._last_error="CreateRemoteThread fail"; self._cave=None; return False
-        kernel32.CloseHandle(th)
+        # патч пролога FUN_6f3063d0: JMP cave (E9 rel32) + NOP -> ровно 6 байт
+        self._hook_orig=self._r(VIEWBUILD,6)
+        if not self._hook_orig or len(self._hook_orig)!=6:
+            self._last_error="не прочитать пролог хука"; self._cave=None; return False
+        patch=b"\xE9"+struct.pack("<i",cave-(VIEWBUILD+5))+b"\x90"
+        if not self._patch_code(VIEWBUILD,patch):
+            self._last_error="patch пролога fail"; self._cave=None; self._hook_orig=None; return False
         self._thread_installed=True
-        self.log("[cine] поток запущен cave=%#x neutral_rot=%.1f eye=(%s,%s) H=%.0f"%(
-            cave,self._neutral_rot_deg,
-            "%.0f"%self._eye_x if self._eye_x is not None else "-",
-            "%.0f"%self._eye_y if self._eye_y is not None else "-",EYE_HEIGHT))
+        self.log("[cine] ХУК на FUN_6f3063d0 (главный поток) cave=%#x neutral_rot=%.1f H=%.0f"%(
+            cave,self._neutral_rot_deg,EYE_HEIGHT))
         return True
+
+    def _patch_code(self, addr, data):
+        try:
+            kernel32.VirtualProtectEx.argtypes=[wt.HANDLE,ctypes.c_void_p,ctypes.c_size_t,wt.DWORD,ctypes.POINTER(wt.DWORD)]
+            old=wt.DWORD(0)
+            if not kernel32.VirtualProtectEx(self._ph,ctypes.c_void_p(addr),len(data),0x40,ctypes.byref(old)):
+                return False
+            self._w(addr,data)
+            kernel32.VirtualProtectEx(self._ph,ctypes.c_void_p(addr),len(data),old,ctypes.byref(old))
+            return True
+        except Exception:
+            return False
+
+    def _uninstall_hook(self):
+        if self._ph and getattr(self,'_hook_orig',None):
+            try: self._patch_code(VIEWBUILD,self._hook_orig)
+            except Exception: pass
+        self._hook_orig=None
+
 
     # ---------- фиксированный глаз: направление взгляда -> поля камеры ----------
     def _write_view(self, yaw_rad, pitch_rad):
@@ -265,20 +332,44 @@ class CineCameraSync:
         sy=-1.0 if INVERT_YAW else 1.0
         sp=-1.0 if INVERT_PITCH else 1.0
         az=math.radians(self._neutral_rot_deg)+sy*yaw_rad
-        e=NEUTRAL_E
+        NE=self._neutral_e; EH=self._eye_height
+        e=NE
         if ENABLE_PITCH:
-            e=NEUTRAL_E + sp*PITCH_GAIN*math.degrees(pitch_rad)
+            e=NE + sp*PITCH_GAIN*math.degrees(pitch_rad)
         e=max(E_MIN,min(E_MAX,e))
         er=math.radians(e)
-        D0=EYE_HEIGHT/math.sin(math.radians(NEUTRAL_E))
-        if e>=NEUTRAL_E:
-            dist=EYE_HEIGHT/math.sin(er); d=EYE_HEIGHT/math.tan(er); zoff=0.0
+        # позиция головы в игровой зоне: шаг/наклон двигает глаз, присед меняет высоту.
+        # сглаживаем (низкочастотный фильтр) — убирает дрожь трекинга и рывки картинки
+        hs=getattr(self,'_head_s',(0.0,0.0,0.0))
+        hf=hs[0]+(self._head[0]-hs[0])*HEAD_SMOOTH
+        hr=hs[1]+(self._head[1]-hs[1])*HEAD_SMOOTH
+        hu=hs[2]+(self._head[2]-hs[2])*HEAD_SMOOTH
+        self._head_s=(hf,hr,hu)
+        az0=math.radians(self._neutral_rot_deg)
+        ex=self._eye_x+POS_SCALE_XY*(hf*math.cos(az0)+hr*math.sin(az0))
+        ey=self._eye_y+POS_SCALE_XY*(hf*math.sin(az0)-hr*math.cos(az0))
+        H=max(EYE_HEIGHT_MIN,min(EYE_HEIGHT_MAX,EH+POS_SCALE_Z*hu))
+        D0=H/math.sin(math.radians(NE))
+        if e>=NE:
+            dist=H/math.sin(er); d=H/math.tan(er); zoff=0.0
         else:
-            dist=D0; d=D0*math.cos(er); zoff=EYE_HEIGHT-D0*math.sin(er)
-        tx=self._eye_x+d*math.cos(az); ty=self._eye_y+d*math.sin(az)
+            dist=D0; d=D0*math.cos(er); zoff=H-D0*math.sin(er)
+        tx=ex+d*math.cos(az); ty=ey+d*math.sin(az)
         if self._bnd is not None:
-            bx0,by0,bx1,by1=self._bnd; m=BND_MARGIN
-            tx=max(bx0+m,min(bx1-m,tx)); ty=max(by0+m,min(by1-m,ty))
+            bx0,by0,bx1,by1=self._bnd
+            txc=max(bx0,min(bx1,tx)); tyc=max(by0,min(by1,ty))
+            if (txc!=tx or tyc!=ty) and self._eye_x is not None:
+                # движок не пускает цель за карту. Чтобы глаз не отъезжал у края —
+                # уменьшаем дистанцию (глаз остаётся на месте, плавно опускается).
+                # На самой границе d_c==d -> дистанция та же (без скачка).
+                d_c=(txc-ex)*math.cos(az)+(tyc-ey)*math.sin(az)
+                cer=math.cos(er)
+                if d_c>50.0 and cer>0.05:
+                    dist=min(dist, max(d_c/cer, dist*0.5))   # не зумить ближе 50%
+            tx,ty=txc,tyc
+        if not (math.isfinite(tx) and math.isfinite(ty) and math.isfinite(dist) and math.isfinite(zoff)):
+            return                                    # никогда не пишем мусор в камеру
+        dist=max(150.0,min(9000.0,dist))
         self._wf(self._ROT,math.degrees(az))
         self._wf(self._AOA,(360.0-e)%360.0)
         self._wf(self._DIST,dist)
@@ -287,18 +378,37 @@ class CineCameraSync:
         self._wf(self._TGTY,ty)
 
     # ---------- перемещение джойстиком (глаз едет в направлении взгляда) ----------
+    def set_camcfg(self, height=None, angle=None):
+        """Живая настройка: height=высота/дистанция камеры, angle=угол обзора (град)."""
+        try:
+            if height is not None:
+                self._eye_height=max(EYE_HEIGHT_MIN,min(EYE_HEIGHT_MAX,float(height)))
+            if angle is not None:
+                self._neutral_e=max(8.0,min(82.0,float(angle)))
+        except (TypeError,ValueError): pass
+
     def set_move(self,mx,my):
         try: self._move=(float(mx),float(my))
         except (TypeError,ValueError): pass
 
+    def set_head(self,fwd,right,up):
+        """Смещение головы от точки recenter (метры): вперёд/вправо/вверх."""
+        try: self._head=(float(fwd),float(right),float(up))
+        except (TypeError,ValueError): pass
+
     def _apply_move(self, yaw_rad, dt):
+        if self._eye_x is None: return
         mx,my=self._move
-        if (abs(mx)<MOVE_DEADZONE and abs(my)<MOVE_DEADZONE) or self._eye_x is None:
-            return
-        sy=-1.0 if INVERT_YAW else 1.0
-        az=math.radians(self._neutral_rot_deg)+sy*yaw_rad
-        fwd=-my if abs(my)>=MOVE_DEADZONE else 0.0     # стик от себя = вперёд
-        strafe=mx if abs(mx)>=MOVE_DEADZONE else 0.0   # стик вбок = стрейф
+        if abs(mx)<MOVE_DEADZONE: mx=0.0
+        if abs(my)<MOVE_DEADZONE: my=0.0
+        # плавный разгон/торможение (низкочастотный фильтр) — без рывков старт/стоп
+        vx,vy=self._move_s
+        vx+=(mx-vx)*MOVE_SMOOTH; vy+=(my-vy)*MOVE_SMOOTH
+        self._move_s=(vx,vy)
+        if abs(vx)<0.004 and abs(vy)<0.004: return
+        syn=-1.0 if INVERT_YAW else 1.0
+        az=math.radians(self._neutral_rot_deg)+syn*yaw_rad
+        fwd=-vy; strafe=vx
         step=MOVE_SPEED*dt
         self._eye_x += step*(fwd*math.cos(az)+strafe*math.sin(az))
         self._eye_y += step*(fwd*math.sin(az)-strafe*math.cos(az))
@@ -325,13 +435,21 @@ class CineCameraSync:
             if self._ph is None:
                 if not self._attach(): time.sleep(1.0); continue
             if self._cave is None:
-                if not self._install_thread(): time.sleep(1.0); continue
+                if not self._install_hook(): time.sleep(1.0); continue
             # держим окно активным, чтобы игра рендерила (не чаще раза в ~1с)
             now=time.time()
             if now-getattr(self,'_last_fg',0)>1.0:
                 self._ensure_foreground(); self._last_fg=now
             yaw,pitch=self._pose
             fixed=FIXED_EYE and self._eye_x is not None and self._TGTX is not None
+            if fixed:
+                # во время перехода (конец матча/загрузка) камера невалидна ->
+                # не трогаем её (иначе гонка -> краш); при возврате валидной
+                # камеры заново привязываем глаз к её текущей цели
+                if not self._camera_valid():
+                    self._wdw(self._ENABLE,0); self._cam_ok=False; continue
+                if not getattr(self,'_cam_ok',False):
+                    self.recenter(); self._cam_ok=True
             if time.time()-self._pose_time>1.0:
                 # позы нет — держим нейтральное направление
                 if fixed: self._write_view(0.0,0.0)

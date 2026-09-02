@@ -9,6 +9,7 @@ WC3 VR Server — захватывает окно Warcraft III и стримит
 import ctypes
 import ctypes.wintypes as wt
 import json
+import queue
 import socket
 import ssl
 import threading
@@ -23,12 +24,15 @@ import numpy as np
 from camera_sync import CameraSync
 from cam_hook_driver import HookCameraSync
 from cam_cine_driver import CineCameraSync
+from audio_stream import AudioHub
 
 # ------------------------- настройки -------------------------
 PORT = 8443                 # HTTPS-порт
-TARGET_FPS = 30             # целевой FPS стрима
-JPEG_QUALITY = 75           # 1..100 (выше = чётче, но больше трафик)
-MAX_WIDTH = 1600            # кадр ужимается до этой ширины (0 = без сжатия)
+TARGET_FPS = 45             # целевой FPS стрима
+JPEG_QUALITY = 58           # 1..100 (ниже = меньше трафик и быстрее декод в шлеме)
+MAX_WIDTH = 1424            # ужать кадр до этой ширины (нативное окно = чётче)
+MAX_FRAME_BYTES = 120000    # потолок размера кадра: тяжёлые (движение по лесу) дожимаем,
+                            # чтобы шлем успевал декодировать (0 = без потолка)
 # Классы окна: "Warcraft III" = классика 1.26-1.29; "OsWindow" = Reforged 1.32.
 # Порядок = приоритет. Сейчас классика первой (1.29 играбельна офлайн без логина);
 # для стрима Reforged поставь "OsWindow" первым.
@@ -87,6 +91,7 @@ class FrameHub:
         self.size = (0, 0)
         self.fps = 0.0
         self.source = "нет"
+        self.clients = 0
 
     def publish(self, jpeg, size):
         with self.cond:
@@ -103,6 +108,7 @@ class FrameHub:
 
 
 hub = FrameHub()
+audio = AudioHub(log=print)      # звук ПК -> /audio (WASAPI loopback)
 
 # --- управление мышью игры из VR-указателя ---
 MOUSEEVENTF = {"ldown": 0x0002, "lup": 0x0004, "rdown": 0x0008, "rup": 0x0010}
@@ -155,9 +161,12 @@ def capture_loop():
     period = 1.0 / TARGET_FPS
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
     fps_count, fps_t0 = 0, time.time()
+    last_sample = None
     with mss.mss() as sct:
         while True:
             t_start = time.time()
+            if hub.clients <= 0:            # никто не смотрит стрим — простой
+                time.sleep(0.2); last_sample = None; continue
             hwnd = find_game_window()
             region = window_client_rect(hwnd) if hwnd else None
             if region is None:
@@ -178,7 +187,22 @@ def capture_loop():
                 scale = MAX_WIDTH / shot.width
                 frame = cv2.resize(frame, (MAX_WIDTH, max(2, int(shot.height * scale))), interpolation=cv2.INTER_AREA)
 
+            sample = frame[::24, ::24, 1].copy()
+            if last_sample is not None and sample.shape == last_sample.shape \
+                    and np.array_equal(sample, last_sample):
+                elapsed = time.time() - t_start
+                if elapsed < period:
+                    time.sleep(period - elapsed)
+                continue
+            last_sample = sample
             ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
+            if ok and MAX_FRAME_BYTES and jpeg.size > MAX_FRAME_BYTES:
+                # кадр тяжёлый (много деталей при панораме) -> дожать сильнее,
+                # иначе шлем не успевает декодировать и картинка «зависает»
+                for q in (46, 36, 28, 20):
+                    ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+                    if ok and jpeg.size <= MAX_FRAME_BYTES:
+                        break
             if ok:
                 hub.publish(jpeg.tobytes(), (frame.shape[1], frame.shape[0]))
                 fps_count += 1
@@ -194,6 +218,13 @@ def capture_loop():
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def log_message(self, *_):
         pass
@@ -218,30 +249,54 @@ class Handler(BaseHTTPRequestHandler):
                 "source": hub.source, "fps": round(hub.fps, 1),
                 "width": hub.size[0], "height": hub.size[1],
                 "camsync": camsync.status(),
+                "audio": {"ok": audio.ok, "error": audio.error,
+                          "device": audio.device_name, "rate": audio.rate},
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif route == "/audio":
+            # сырой PCM int16: заголовок WCVA + rate + ch + bits, далее поток
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            q = audio.subscribe()
+            try:
+                self.wfile.write(audio.header()); self.wfile.flush()
+                while True:
+                    try:
+                        data = q.get(timeout=2.0)
+                    except queue.Empty:
+                        continue
+                    self.wfile.write(data); self.wfile.flush()
+            except (ConnectionError, BrokenPipeError, OSError):
+                pass
+            finally:
+                audio.unsubscribe(q)
         elif route == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             seq = 0
+            hub.clients += 1
             try:
                 while True:
                     jpeg, seq_new = hub.wait_frame(seq)
                     if jpeg is None or seq_new == seq:
                         continue
                     seq = seq_new
-                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
-                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
-                    self.wfile.write(jpeg)
-                    self.wfile.write(b"\r\n")
+                    self.wfile.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                        + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
             except (ConnectionError, BrokenPipeError, OSError):
                 pass
+            finally:
+                hub.clients -= 1
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -259,6 +314,8 @@ class Handler(BaseHTTPRequestHandler):
             camsync.set_pose(payload.get("yaw", 0.0), payload.get("pitch", 0.0))
             if hasattr(camsync, "set_move"):
                 camsync.set_move(payload.get("mx", 0.0), payload.get("my", 0.0))
+            if hasattr(camsync, "set_head"):
+                camsync.set_head(payload.get("fwd", 0.0), payload.get("right", 0.0), payload.get("up", 0.0))
             body = b"{}"
         elif route == "/camsync":
             if payload.get("on"):
@@ -268,6 +325,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(camsync.status()).encode()
         elif route == "/input":
             handle_input(payload)
+            body = b"{}"
+        elif route == "/camcfg":
+            if hasattr(camsync, "set_camcfg"):
+                camsync.set_camcfg(payload.get("height"), payload.get("angle"))
             body = b"{}"
         elif route == "/recenter":
             camsync.recenter()

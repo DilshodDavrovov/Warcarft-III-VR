@@ -14,6 +14,9 @@
   button { background: #17233a; color: #e6eefc; border: 1px solid #2d4468;
            border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
   button.on { background: #2d4468; border-color: #5b83c0; }
+  .camctl { font-size: 12px; display: flex; align-items: center; gap: 6px; opacity: .9; }
+  .camctl input[type=range] { width: 92px; accent-color: #5b83c0; }
+  .camctl b { min-width: 34px; color: #8fd18f; }
   #enterVR { background: #7a5c16; border-color: #c9a13c; font-weight: 700; font-size: 16px; }
   #enterVR:disabled { opacity: .45; cursor: default; }
   #title { position: fixed; top: 12px; left: 18px; z-index: 10; font-size: 14px;
@@ -24,23 +27,39 @@
 <div id="title">Warcraft III &middot; VR 360</div>
 <div id="hud">
   <div class="grow" id="status">Подключение к стриму&hellip;</div>
+  <button data-preset="monitor60" title="Весь кадр игры в поле зрения (компактно)">Монитор 60&deg;</button>
+  <button data-preset="monitor75" title="Весь кадр игры в поле зрения (рекомендуется)">Монитор 75&deg;</button>
+  <button data-preset="monitor90" title="Крупнее, края у границы обзора">Монитор 90&deg;</button>
   <button data-preset="theater">Кинотеатр 110&deg;</button>
-  <button data-preset="panorama" class="on">Панорама 180&deg;</button>
+  <button data-preset="panorama">Панорама 180&deg;</button>
   <button data-preset="dome">Купол 250&deg;</button>
+  <button data-aspect="auto" title="Пропорции как в игре — без искажений">Проп: Авто</button>
+  <button data-aspect="16:9">16:9</button>
+  <button data-aspect="16:10">16:10</button>
+  <button data-aspect="4:3">4:3</button>
+  <button data-aspect="21:9">21:9</button>
+  <button id="audio" title="Звук игры в шлем (захват вывода ПК)">Звук: ВЫКЛ</button>
   <button id="camsync" title="Поворот головы крутит камеру в игре (Insert/Delete/PageUp/Down). Только одиночная игра!">Камера игры: ВЫКЛ</button>
   <button id="enterVR" disabled>ВОЙТИ В VR</button>
+  <label class="camctl" title="Высота/дистанция камеры — «рост» над картой">Высота <input id="hgt" type="range" min="600" max="4000" step="50"><b id="hgtv">–</b></label>
+  <label class="camctl" title="Угол обзора: меньше — к горизонту, больше — сверху на карту">Угол <input id="ang" type="range" min="0" max="80" step="1"><b id="angv">–</b></label>
 </div>
 
 <script type="module">
 import * as THREE from './three.module.min.js';
 
+// «Монитор» — угловой размер экрана меньше поля зрения шлема (~90°), чтобы
+// ВЕСЬ кадр игры (включая нижний интерфейс) был виден без поворота головы.
 const PRESETS = {
-  theater:  { wrap: 110 * Math.PI / 180, radius: 3.4 },
-  panorama: { wrap: 180 * Math.PI / 180, radius: 2.8 },
-  dome:     { wrap: 250 * Math.PI / 180, radius: 2.4 },
+  monitor60: { wrap:  60 * Math.PI / 180, radius: 3.2 },
+  monitor75: { wrap:  75 * Math.PI / 180, radius: 3.2 },
+  monitor90: { wrap:  90 * Math.PI / 180, radius: 3.0 },
+  theater:   { wrap: 110 * Math.PI / 180, radius: 3.4 },
+  panorama:  { wrap: 180 * Math.PI / 180, radius: 2.8 },
+  dome:      { wrap: 250 * Math.PI / 180, radius: 2.4 },
 };
-let preset = localStorage.getItem('wc3vr-preset') || 'panorama';
-if (!PRESETS[preset]) preset = 'panorama';
+let preset = localStorage.getItem('wc3vr-preset') || 'monitor75';
+if (!PRESETS[preset]) preset = 'monitor75';
 
 // калибровка указателя (если курсор зеркалит — поменяй на true):
 const INVERT_PX = false;   // горизонталь
@@ -75,13 +94,17 @@ texture.minFilter = THREE.LinearFilter;
 texture.generateMipmaps = false;
 
 let screenMesh = null;
-let aspect = 16 / 9;
+let aspect = 16 / 9;                 // фактические пропорции видео (детект из кадра)
+const ASPECTS = { '16:9': 16/9, '16:10': 16/10, '4:3': 4/3, '21:9': 21/9, '2:1': 2/1 };
+let aspectMode = localStorage.getItem('wc3vr-aspect') || 'auto';   // 'auto' или ключ ASPECTS
+if (aspectMode !== 'auto' && !ASPECTS[aspectMode]) aspectMode = 'auto';
+function effAspect() { return aspectMode === 'auto' ? aspect : ASPECTS[aspectMode]; }
 let screenBaseY = 1.6;
 
 function buildScreen() {
   if (screenMesh) { scene.remove(screenMesh); screenMesh.geometry.dispose(); }
   const { wrap, radius } = PRESETS[preset];
-  const height = Math.min((radius * wrap) / aspect, 8);
+  const height = Math.min((radius * wrap) / effAspect(), 8);
   const geo = new THREE.CylinderGeometry(radius, radius, height, 72, 1, true,
                                          Math.PI - wrap / 2, wrap);
   const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide,
@@ -144,7 +167,7 @@ async function onFrame(blob) {
   try {
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
     const newAspect = bmp.width / bmp.height;
-    if (Math.abs(newAspect - aspect) > 0.01) { aspect = newAspect; buildScreen(); }
+    if (Math.abs(newAspect - aspect) > 0.01) { aspect = newAspect; if (aspectMode === 'auto') buildScreen(); }
     if (texture.image && texture.image.close) texture.image.close();
     texture.image = bmp;
     texture.needsUpdate = true;
@@ -154,17 +177,41 @@ async function onFrame(blob) {
 connectStream();
 
 // --- статус с сервера ---
+const hgt = document.getElementById('hgt'), ang = document.getElementById('ang');
+const hgtv = document.getElementById('hgtv'), angv = document.getElementById('angv');
+let camcfgReady = false;
+function showCamcfg() { hgtv.textContent = hgt.value; angv.textContent = ang.value + '\u00B0'; }
+function pushCamcfg() {
+  showCamcfg();
+  localStorage.setItem('wc3vr-hgt', hgt.value);
+  localStorage.setItem('wc3vr-ang', ang.value);
+  fetch('/camcfg', { method: 'POST', body: JSON.stringify({ height: +hgt.value, angle: +ang.value }) }).catch(() => {});
+}
+hgt.oninput = pushCamcfg;
+ang.oninput = pushCamcfg;
+(function initCamcfg() {
+  const h = localStorage.getItem('wc3vr-hgt'), a = localStorage.getItem('wc3vr-ang');
+  if (h && a) { hgt.value = h; ang.value = a; showCamcfg(); camcfgReady = true; pushCamcfg(); }
+  else showCamcfg();
+})();
+
 async function pollStatus() {
   try {
     const s = await (await fetch('/status')).json();
+    if (!camcfgReady && s.camsync && s.camsync.eye_height) {
+      hgt.value = s.camsync.eye_height; ang.value = s.camsync.neutral_e; showCamcfg(); camcfgReady = true;
+    }
     let cam = '';
     if (s.camsync && s.camsync.enabled) {
       cam = s.camsync.attached ? ' &middot; <b style="color:#8fd18f">камера: синхр.</b>'
                                : ` &middot; <b style="color:#d1a08f">камера: ${s.camsync.error || 'жду игру'}</b>`;
     }
+    let au = '';
+    if (s.audio) au = s.audio.ok ? ` &middot; звук: <b style="color:#8fd18f">${s.audio.rate} Hz</b>`
+                                 : ` &middot; <b style="color:#d1a08f">звук: ${s.audio.error || 'нет'}</b>`;
     statusEl.innerHTML =
       `Источник: <b>${s.source}</b> &middot; ${s.width}&times;${s.height}` +
-      ` &middot; сервер ${s.fps} fps &middot; приём ${streamFps} fps` + cam;
+      ` &middot; сервер ${s.fps} fps &middot; приём ${streamFps} fps` + cam + au;
   } catch { statusEl.textContent = 'Нет связи с сервером…'; }
   setTimeout(pollStatus, 2000);
 }
@@ -177,7 +224,10 @@ camsyncBtn.onclick = async () => {
   camsyncOn = !camsyncOn;
   camsyncBtn.textContent = 'Камера игры: ' + (camsyncOn ? 'ВКЛ' : 'ВЫКЛ');
   camsyncBtn.classList.toggle('on', camsyncOn);
-  if (camsyncOn) needNeutral = true;   // «прямо» = текущее направление головы
+  if (camsyncOn) {
+    needNeutral = true;   // «прямо» = текущее направление и ПОЗИЦИЯ головы
+    if (PRESETS[preset].wrap > 100 * Math.PI / 180) setPreset('monitor75');
+  }
   try { await fetch('/camsync', { method: 'POST', body: JSON.stringify({ on: camsyncOn }) }); }
   catch {}
 };
@@ -186,12 +236,13 @@ const _q = new THREE.Quaternion(), _e = new THREE.Euler();
 const _p = new THREE.Vector3(), _sq = new THREE.Quaternion();
 let lastPoseT = 0, screenYaw = 0;
 let neutralYaw = 0, neutralPitch = 0, needNeutral = false;
+const neutralPos = new THREE.Vector3(), _hp = new THREE.Vector3(), _hd = new THREE.Vector3();
 function angDelta(a) { return Math.atan2(Math.sin(a), Math.cos(a)); }
 
-function sendPose(yaw, pitch, mx, my, t) {
+function sendPose(o, t) {
   if (t - lastPoseT < 33) return;
   lastPoseT = t;
-  fetch('/pose', { method: 'POST', body: JSON.stringify({ yaw, pitch, mx, my }) }).catch(() => {});
+  fetch('/pose', { method: 'POST', body: JSON.stringify(o) }).catch(() => {});
 }
 
 // стики контроллеров (перемещение камеры): берём стик с большим отклонением
@@ -208,16 +259,85 @@ function readSticks() {
 }
 
 // --- кнопки пресетов ---
+function setPreset(name) {
+  if (!PRESETS[name]) return;
+  preset = name;
+  localStorage.setItem('wc3vr-preset', preset);
+  document.querySelectorAll('[data-preset]').forEach(b =>
+    b.classList.toggle('on', b.dataset.preset === preset));
+  buildScreen();
+}
 document.querySelectorAll('[data-preset]').forEach(btn => {
   btn.classList.toggle('on', btn.dataset.preset === preset);
-  btn.onclick = () => {
-    preset = btn.dataset.preset;
-    localStorage.setItem('wc3vr-preset', preset);
-    document.querySelectorAll('[data-preset]').forEach(b =>
-      b.classList.toggle('on', b === btn));
-    buildScreen();
-  };
+  btn.onclick = () => setPreset(btn.dataset.preset);
 });
+function setAspect(name) {
+  aspectMode = (name === 'auto' || ASPECTS[name]) ? name : 'auto';
+  localStorage.setItem('wc3vr-aspect', aspectMode);
+  document.querySelectorAll('[data-aspect]').forEach(b =>
+    b.classList.toggle('on', b.dataset.aspect === aspectMode));
+  buildScreen();
+}
+document.querySelectorAll('[data-aspect]').forEach(btn => {
+  btn.classList.toggle('on', btn.dataset.aspect === aspectMode);
+  btn.onclick = () => setAspect(btn.dataset.aspect);
+});
+
+// --- звук игры в шлем: сырой PCM по fetch -> Web Audio с малой задержкой ---
+let audioOn = false, audioCtx = null, audioAbort = null;
+const audioBtn = document.getElementById('audio');
+audioBtn.onclick = () => { audioOn ? stopAudio() : startAudio(); };
+function stopAudio() {
+  audioOn = false; localStorage.setItem('wc3vr-audio', '0');
+  audioBtn.textContent = 'Звук: ВЫКЛ'; audioBtn.classList.remove('on');
+  if (audioAbort) { audioAbort.abort(); audioAbort = null; }
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+}
+async function startAudio() {
+  if (audioOn) return;
+  audioOn = true; localStorage.setItem('wc3vr-audio', '1');
+  audioBtn.textContent = 'Звук: ВКЛ'; audioBtn.classList.add('on');
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  try { await audioCtx.resume(); } catch (e) {}
+  audioAbort = new AbortController();
+  const MIN_LEAD = 0.06, MAX_LEAD = 0.35;
+  let nextT = 0;
+  try {
+    const resp = await fetch('/audio', { signal: audioAbort.signal });
+    const reader = resp.body.getReader();
+    let buf = new Uint8Array(0), rate = 48000, ch = 2, gotHeader = false;
+    for (;;) {
+      const rd = await reader.read();
+      if (rd.done || !audioOn) break;
+      const merged = new Uint8Array(buf.length + rd.value.length);
+      merged.set(buf); merged.set(rd.value, buf.length); buf = merged;
+      if (!gotHeader) {
+        if (buf.length < 12) continue;
+        if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== 'WCVA') throw new Error('bad audio header');
+        const dv = new DataView(buf.buffer, buf.byteOffset, 12);
+        rate = dv.getUint32(4, true); ch = dv.getUint16(8, true);
+        buf = buf.subarray(12); gotHeader = true;
+      }
+      const frameBytes = ch * 2, frames = Math.floor(buf.length / frameBytes);
+      if (frames < 1536) continue;   // копим ~32мс: меньше нагрузки на CPU шлема
+      const usable = frames * frameBytes;
+      const chunk = buf.subarray(0, usable); buf = buf.subarray(usable);
+      const i16 = new Int16Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + usable));
+      const ab = audioCtx.createBuffer(ch, frames, rate);
+      for (let c = 0; c < ch; c++) {
+        const out = ab.getChannelData(c);
+        for (let i = 0; i < frames; i++) out[i] = i16[i * ch + c] / 32768;
+      }
+      const now = audioCtx.currentTime;
+      if (nextT < now + MIN_LEAD) nextT = now + MIN_LEAD;
+      if (nextT > now + MAX_LEAD) continue;
+      const src = audioCtx.createBufferSource();
+      src.buffer = ab; src.connect(audioCtx.destination);
+      src.start(nextT); nextT += ab.duration;
+    }
+  } catch (e) { if (audioOn) console.warn('audio', e); }
+  if (audioOn) stopAudio();
+}
 
 // --- кнопка VR ---
 const enterBtn = document.getElementById('enterVR');
@@ -233,6 +353,7 @@ enterBtn.onclick = async () => {
   const session = await navigator.xr.requestSession('immersive-vr',
     { optionalFeatures: ['local-floor'] });
   session.addEventListener('end', () => { enterBtn.textContent = 'ВОЙТИ В VR'; });
+  if (localStorage.getItem('wc3vr-audio') === '1' && !audioOn) startAudio();
   await renderer.xr.setSession(session);
   enterBtn.textContent = 'В VR…';
   if (camsyncOn) needNeutral = true;   // центр = куда смотришь при входе в VR
@@ -309,7 +430,7 @@ function updatePointer(t) {
   const left  = !!(bestGp.buttons[0] && bestGp.buttons[0].pressed);   // триггер -> ЛКМ
   const right = !!(bestGp.buttons[1] && bestGp.buttons[1].pressed);   // grip    -> ПКМ
   wasActive = true;
-  if (t - lastInputT < 40 && left === pLeft && right === pRight) return;  // не спамим
+  if (t - lastInputT < 66 && left === pLeft && right === pRight) return;  // не спамим
   lastInputT = t; pLeft = left; pRight = right;
   sendInput({ active: true, nx, ny, left, right });
 }
@@ -318,14 +439,22 @@ renderer.setAnimationLoop((t) => {
   if (camsyncOn) {
     camera.getWorldQuaternion(_q);
     _e.setFromQuaternion(_q, 'YXZ');
+    camera.getWorldPosition(_hp);
     if (needNeutral) {
-      neutralYaw = _e.y; neutralPitch = _e.x; needNeutral = false;
+      neutralYaw = _e.y; neutralPitch = _e.x; neutralPos.copy(_hp); needNeutral = false;
       fetch('/recenter', { method: 'POST' }).catch(() => {});   // камера = «прямо»
     }
-    // угол головы ОТНОСИТЕЛЬНО «прямо» задаёт направление взгляда игровой
-    // камеры; стик контроллера — перемещение (вперёд/вбок в направлении взгляда)
+    // угол головы ОТНОСИТЕЛЬНО «прямо» задаёт направление взгляда игровой камеры;
+    // ПОЗИЦИЯ головы (шаг/наклон/присед в игровой зоне) двигает глаз камеры;
+    // стик контроллера — полёт вперёд/вбок в направлении взгляда
+    _hd.subVectors(_hp, neutralPos);
+    const cy = Math.cos(neutralYaw), sy = Math.sin(neutralYaw);
+    const fwd   = -(_hd.x * sy + _hd.z * cy);   // вдоль «прямо»
+    const right =   _hd.x * cy - _hd.z * sy;    // вправо от «прямо»
+    const up    =   _hd.y;                      // присел/встал
     const [mvx, mvy] = readSticks();
-    sendPose(angDelta(_e.y - neutralYaw), _e.x - neutralPitch, mvx, mvy, t);
+    sendPose({ yaw: angDelta(_e.y - neutralYaw), pitch: _e.x - neutralPitch,
+               mx: mvx, my: mvy, fwd, right, up }, t);
   }
   // экран:
   //  • режим камеры игры (первое лицо) — экран ЗАКРЕПЛЁН ЗА ГОЛОВОЙ: центрируется
