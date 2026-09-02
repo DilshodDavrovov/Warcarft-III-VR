@@ -57,6 +57,9 @@ NEUTRAL_E=58.0                   # нейтральный угол взгляд�
 E_MIN=-45.0; E_MAX=84.0          # угол взгляда вниз; <0 = выше горизонта (в WC3 там
                                  # пусто/чёрно — движок не рисует небо в melee-картах)
 FARZ_VALUE=10000.0               # дальность прорисовки (горизонт дальше)
+CAM_DIST=600.0                   # дистанция глаз-цель: держим МАЛОЙ, чтобы цель не
+                                 # улетала вдаль и не упиралась в край карты (вид от неё
+                                 # не зависит — только от глаза и направления)
 SETPOS_EVERY=2                   # SetPos (позиция цели) раз в N кадров (сетка не любит частого)
 MOVE_SPEED=1100.0                # перемещение джойстиком (юниты/сек) — мягче панорама
 HEAD_SMOOTH=0.25                 # сглаживание позы головы (0..1; меньше = плавнее, но с лагом)
@@ -349,11 +352,13 @@ class CineCameraSync:
         ex=self._eye_x+POS_SCALE_XY*(hf*math.cos(az0)+hr*math.sin(az0))
         ey=self._eye_y+POS_SCALE_XY*(hf*math.sin(az0)-hr*math.cos(az0))
         H=max(EYE_HEIGHT_MIN,min(EYE_HEIGHT_MAX,EH+POS_SCALE_Z*hu))
-        D0=H/math.sin(math.radians(NE))
-        if e>=NE:
-            dist=H/math.sin(er); d=H/math.tan(er); zoff=0.0
-        else:
-            dist=D0; d=D0*math.cos(er); zoff=H-D0*math.sin(er)
+        # Цель близко к глазу (фикс. малая дистанция R): вид определяется глазом и
+        # направлением, НЕ дистанцией -> тот же вид, но цель не улетает в даль и
+        # не упирается в край карты. zOffset поднимает цель, глаз на высоте H над террейном.
+        R=CAM_DIST
+        dist=R
+        d=R*math.cos(er)
+        zoff=H-R*math.sin(er)
         tx=ex+d*math.cos(az); ty=ey+d*math.sin(az)
         if self._bnd is not None:
             bx0,by0,bx1,by1=self._bnd
