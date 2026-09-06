@@ -43,6 +43,10 @@
   <button id="enterVR" disabled>ВОЙТИ В VR</button>
   <label class="camctl" title="Высота/дистанция камеры — «рост» над картой">Высота <input id="hgt" type="range" min="600" max="4000" step="50"><b id="hgtv">–</b></label>
   <label class="camctl" title="Угол обзора: меньше — к горизонту, больше — сверху на карту">Угол <input id="ang" type="range" min="0" max="80" step="1"><b id="angv">–</b></label>
+  <button id="uisplit" title="Мир по полю зрения + панели интерфейса отдельными плашками ближе к зрителю">Панели: АВТО</button>
+  <label class="camctl" title="Какую долю ширины мира передавать (края вне поля зрения отрезаем)">Мир <input id="crop" type="range" min="50" max="100" step="2"><b id="cropv">–</b></label>
+  <label class="camctl" title="Размер панелей интерфейса в VR">Панели <input id="pscale" type="range" min="50" max="200" step="5"><b id="pscalev">–</b></label>
+  <label class="camctl" title="Дистанция панелей: ближе — сильнее эффект присутствия">Близость <input id="pdist" type="range" min="50" max="160" step="5"><b id="pdistv">–</b></label>
 </div>
 
 <script type="module">
@@ -87,13 +91,92 @@ document.body.appendChild(renderer.domElement);
 const texture = new THREE.Texture();
 texture.colorSpace = THREE.SRGBColorSpace;
 texture.flipY = false;
-texture.wrapS = THREE.RepeatWrapping;
-texture.repeat.x = -1;
-texture.offset.x = 1;
+texture.wrapS = THREE.ClampToEdgeWrapping;
+texture.wrapT = THREE.ClampToEdgeWrapping;
+// зеркалирование для экрана-цилиндра (вид изнутри) запечено в UV — см. bakeUV
 texture.minFilter = THREE.LinearFilter;
 texture.generateMipmaps = false;
 
 let screenMesh = null;
+
+// --- раздельный интерфейс: атлас (мир + панели) и раскладка от сервера ---
+const hud = new THREE.Group();           // экран + панели; в режиме камеры едет с головой
+scene.add(hud);
+let layout = null, layoutSeq = -1;
+let hudMeshes = [];                      // все плашки для указателя
+const panelMeshes = {};
+const DEG = Math.PI / 180;
+// положение панелей в поле зрения: yaw(+влево), pitch(+вверх), dist(м), width(м)
+const PANEL_POS = {
+  minimap: { yaw:  30, pitch: -27, dist: 2.2, width: 0.95 },
+  unit:    { yaw:   0, pitch: -30, dist: 2.3, width: 1.70 },
+  cmd:     { yaw: -30, pitch: -27, dist: 2.2, width: 0.95 },
+  top:     { yaw:   0, pitch:  27, dist: 2.6, width: 2.60 },
+  heroes:  { yaw:  38, pitch:  -4, dist: 2.4, width: 0.22 },
+};
+let panelScale = parseFloat(localStorage.getItem('wc3vr-pscale')) || 1.0;
+let panelDist  = parseFloat(localStorage.getItem('wc3vr-pdist'))  || 1.0;
+const _lookM = new THREE.Matrix4(), _zero = new THREE.Vector3(0, 0, 0), _up = new THREE.Vector3(0, 1, 0);
+function worldRegion() { return layout && layout.regions && layout.regions.world; }
+function worldAspect() {
+  const w = worldRegion();
+  if (w) { const r = w.src; return (r[2] - r[0]) / Math.max(1, (r[3] - r[1])); }
+  return aspect;
+}
+// прямоугольник региона в UV атласа (текстура: v=0 — низ кадра)
+function regionUV(name) {
+  const R = layout && layout.regions && layout.regions[name];
+  if (!R) return { u0: 0, u1: 1, v0: 0, v1: 1 };
+  const AW = layout.atlas[0], AH = layout.atlas[1], d = R.dst;
+  return { u0: d[0] / AW, u1: d[2] / AW, v0: 1 - d[3] / AH, v1: 1 - d[1] / AH };
+}
+// запечь UV геометрии в прямоугольник атласа; mirrorX — для экрана-цилиндра (вид изнутри)
+function bakeUV(geo, r, mirrorX) {
+  const uv = geo.attributes.uv;
+  if (!geo.userData.uv0) geo.userData.uv0 = uv.array.slice();   // исходные 0..1
+  const src = geo.userData.uv0;
+  for (let i = 0; i < uv.count; i++) {
+    const u = src[i * 2], v = src[i * 2 + 1];
+    uv.setXY(i, mirrorX ? (r.u1 - u * (r.u1 - r.u0)) : (r.u0 + u * (r.u1 - r.u0)),
+                r.v0 + v * (r.v1 - r.v0));
+  }
+  uv.needsUpdate = true;
+}
+function rebuildHudList() { hudMeshes = [screenMesh].concat(Object.values(panelMeshes)).filter(Boolean); }
+// панели интерфейса — плашки БЛИЖЕ к зрителю (сильнее эффект присутствия)
+function buildPanels() {
+  for (const k of Object.keys(panelMeshes)) {
+    hud.remove(panelMeshes[k]); panelMeshes[k].geometry.dispose(); delete panelMeshes[k];
+  }
+  if (!layout || !layout.split) { rebuildHudList(); return; }
+  for (const name in PANEL_POS) {
+    const R = layout.regions[name]; if (!R) continue;
+    const P = PANEL_POS[name];
+    const sw = R.src[2] - R.src[0], sh = R.src[3] - R.src[1];
+    const w = P.width * panelScale, h = w * sh / Math.max(1, sw);
+    const geo = new THREE.PlaneGeometry(w, h);
+    bakeUV(geo, regionUV(name), false);
+    const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.FrontSide,
+                                              fog: false, toneMapped: false });
+    const m = new THREE.Mesh(geo, mat);
+    const th = P.yaw * DEG, ph = P.pitch * DEG, d = P.dist * panelDist;
+    m.position.set(-d * Math.sin(th) * Math.cos(ph), d * Math.sin(ph), -d * Math.cos(th) * Math.cos(ph));
+    _lookM.lookAt(_zero, m.position, _up);   // +Z плашки смотрит на голову (локально)
+    m.quaternion.setFromRotationMatrix(_lookM);
+    m.renderOrder = 5;
+    m.userData.region = name;
+    hud.add(m); panelMeshes[name] = m;
+  }
+  rebuildHudList();
+}
+async function fetchLayout() {
+  try {
+    const L = await (await fetch('/layout')).json();
+    if (!L || !L.regions || !L.regions.world) return;
+    layout = L; layoutSeq = L.seq;
+    buildScreen(); buildPanels();
+  } catch (e) {}
+}
 let aspect = 16 / 9;                 // фактические пропорции видео (детект из кадра)
 const ASPECTS = { '16:9': 16/9, '16:10': 16/10, '4:3': 4/3, '21:9': 21/9, '2:1': 2/1 };
 let aspectMode = localStorage.getItem('wc3vr-aspect') || 'auto';   // 'auto' или ключ ASPECTS
@@ -102,21 +185,24 @@ function effAspect() { return aspectMode === 'auto' ? aspect : ASPECTS[aspectMod
 let screenBaseY = 1.6;
 
 function buildScreen() {
-  if (screenMesh) { scene.remove(screenMesh); screenMesh.geometry.dispose(); }
+  if (screenMesh) { hud.remove(screenMesh); screenMesh.geometry.dispose(); screenMesh = null; }
   const { wrap, radius } = PRESETS[preset];
-  const height = Math.min((radius * wrap) / effAspect(), 8);
+  const asp = aspectMode === 'auto' ? worldAspect() : ASPECTS[aspectMode];
+  const height = Math.min((radius * wrap) / asp, 8);
   const geo = new THREE.CylinderGeometry(radius, radius, height, 72, 1, true,
                                          Math.PI - wrap / 2, wrap);
+  bakeUV(geo, regionUV('world'), true);
   const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.BackSide,
                                             fog: false, toneMapped: false });
   screenMesh = new THREE.Mesh(geo, mat);
-  // в режиме «первое лицо» экран центрируется на голове (см. цикл рендера),
-  // поэтому центр экрана держим на уровне глаз, а не приподнятым
+  screenMesh.userData.region = 'world';
+  // центр экрана — на уровне глаз (в режиме камеры группа HUD едет с головой)
   screenBaseY = Math.max(1.6, height / 2 - 0.2);
-  screenMesh.position.y = screenBaseY;
-  scene.add(screenMesh);
+  hud.add(screenMesh);
+  rebuildHudList();
 }
 buildScreen();
+fetchLayout();
 
 // --- приём MJPEG-потока через fetch ---
 const statusEl = document.getElementById('status');
@@ -167,7 +253,7 @@ async function onFrame(blob) {
   try {
     const bmp = await createImageBitmap(blob, { imageOrientation: 'flipY' });
     const newAspect = bmp.width / bmp.height;
-    if (Math.abs(newAspect - aspect) > 0.01) { aspect = newAspect; if (aspectMode === 'auto') buildScreen(); }
+    if (Math.abs(newAspect - aspect) > 0.01) { aspect = newAspect; if (!layout && aspectMode === 'auto') buildScreen(); }
     if (texture.image && texture.image.close) texture.image.close();
     texture.image = bmp;
     texture.needsUpdate = true;
@@ -195,9 +281,41 @@ ang.oninput = pushCamcfg;
   else showCamcfg();
 })();
 
+// --- раздельный интерфейс: управление ---
+const uisplitBtn = document.getElementById('uisplit');
+const cropEl = document.getElementById('crop'), cropV = document.getElementById('cropv');
+const pscaleEl = document.getElementById('pscale'), pscaleV = document.getElementById('pscalev');
+const pdistEl = document.getElementById('pdist'), pdistV = document.getElementById('pdistv');
+const UI_MODES = ['auto', 'on', 'off'], UI_MODE_LABEL = { auto: 'АВТО', on: 'ВКЛ', off: 'ВЫКЛ' };
+let uiMode = localStorage.getItem('wc3vr-uimode') || 'auto';
+if (UI_MODES.indexOf(uiMode) < 0) uiMode = 'auto';
+function showUi() {
+  uisplitBtn.textContent = 'Панели: ' + UI_MODE_LABEL[uiMode];
+  uisplitBtn.classList.toggle('on', uiMode !== 'off');
+  cropV.textContent = cropEl.value + '%';
+  pscaleV.textContent = pscaleEl.value + '%';
+  pdistV.textContent = pdistEl.value + '%';
+}
+function pushUiMode() {
+  fetch('/uimode', { method: 'POST',
+    body: JSON.stringify({ split: uiMode, crop_x: (+cropEl.value) / 100 }) }).catch(() => {});
+}
+uisplitBtn.onclick = () => {
+  uiMode = UI_MODES[(UI_MODES.indexOf(uiMode) + 1) % UI_MODES.length];
+  localStorage.setItem('wc3vr-uimode', uiMode); showUi(); pushUiMode();
+};
+cropEl.oninput = () => { localStorage.setItem('wc3vr-crop', cropEl.value); showUi(); pushUiMode(); };
+pscaleEl.oninput = () => { panelScale = (+pscaleEl.value) / 100; localStorage.setItem('wc3vr-pscale', panelScale); showUi(); buildPanels(); };
+pdistEl.oninput  = () => { panelDist  = (+pdistEl.value)  / 100; localStorage.setItem('wc3vr-pdist',  panelDist);  showUi(); buildPanels(); };
+cropEl.value = localStorage.getItem('wc3vr-crop') || 80;
+pscaleEl.value = Math.round(panelScale * 100);
+pdistEl.value = Math.round(panelDist * 100);
+showUi(); pushUiMode();
+
 async function pollStatus() {
   try {
     const s = await (await fetch('/status')).json();
+    if (typeof s.layout_seq === 'number' && s.layout_seq !== layoutSeq) fetchLayout();
     if (!camcfgReady && s.camsync && s.camsync.eye_height) {
       hgt.value = s.camsync.eye_height; ang.value = s.camsync.neutral_e; showCamcfg(); camcfgReady = true;
     }
@@ -412,7 +530,7 @@ function updatePointer(t) {
     tmpMat.identity().extractRotation(c.matrixWorld);
     raycaster.ray.origin.setFromMatrixPosition(c.matrixWorld);
     raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpMat);
-    const hit = raycaster.intersectObject(screenMesh, false)[0];
+    const hit = raycaster.intersectObjects(hudMeshes, false)[0];
     if (hit) {
       if (laser) laser.scale.z = hit.distance;
       if (!best || hit.distance < best.distance) { best = hit; bestGp = c.userData.gp; }
@@ -424,8 +542,23 @@ function updatePointer(t) {
     return;
   }
   dot.position.copy(best.point); dot.visible = true;
-  let nx = INVERT_PX ? best.uv.x : 1 - best.uv.x;
-  let ny = INVERT_PY ? best.uv.y : 1 - best.uv.y;
+  let nx, ny;
+  {
+    const name = (best.object.userData && best.object.userData.region) || 'world';
+    const R = layout && layout.regions && layout.regions[name];
+    if (R) {
+      const AW = layout.atlas[0], AH = layout.atlas[1], d = R.dst;
+      let fx = (best.uv.x - d[0] / AW) / ((d[2] - d[0]) / AW);
+      let fy = 1 - (best.uv.y - (1 - d[3] / AH)) / ((d[3] - d[1]) / AH);   // 0 = верх региона
+      if (INVERT_PX) fx = 1 - fx;
+      if (INVERT_PY) fy = 1 - fy;
+      nx = (R.src[0] + fx * (R.src[2] - R.src[0])) / layout.win[0];
+      ny = (R.src[1] + fy * (R.src[3] - R.src[1])) / layout.win[1];
+    } else {
+      nx = INVERT_PX ? 1 - best.uv.x : best.uv.x;     // UV запечён на весь кадр (зеркало учтено)
+      ny = INVERT_PY ? best.uv.y : 1 - best.uv.y;
+    }
+  }
   nx = Math.min(1, Math.max(0, nx)); ny = Math.min(1, Math.max(0, ny));
   const left  = !!(bestGp.buttons[0] && bestGp.buttons[0].pressed);   // триггер -> ЛКМ
   const right = !!(bestGp.buttons[1] && bestGp.buttons[1].pressed);   // grip    -> ПКМ
@@ -465,12 +598,12 @@ renderer.setAnimationLoop((t) => {
     if (camsyncOn) {
       camera.getWorldPosition(_p);
       camera.getWorldQuaternion(_sq);
-      screenMesh.position.copy(_p);
-      screenMesh.quaternion.copy(_sq);
+      hud.position.copy(_p);
+      hud.quaternion.copy(_sq);
     } else {
       screenYaw += angDelta(0 - screenYaw) * 0.12;
-      screenMesh.rotation.set(0, screenYaw, 0);
-      screenMesh.position.set(0, screenBaseY, 0);
+      hud.rotation.set(0, screenYaw, 0);
+      hud.position.set(0, screenBaseY, 0);
     }
   }
   updatePointer(t);

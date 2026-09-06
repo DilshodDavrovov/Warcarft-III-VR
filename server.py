@@ -25,6 +25,7 @@ from camera_sync import CameraSync
 from cam_hook_driver import HookCameraSync
 from cam_cine_driver import CineCameraSync
 from audio_stream import AudioHub
+from ui_layout import Layout, scale_layout
 
 # ------------------------- настройки -------------------------
 PORT = 8443                 # HTTPS-порт
@@ -33,6 +34,11 @@ JPEG_QUALITY = 58           # 1..100 (ниже = меньше трафик и б
 MAX_WIDTH = 1424            # ужать кадр до этой ширины (нативное окно = чётче)
 MAX_FRAME_BYTES = 120000    # потолок размера кадра: тяжёлые (движение по лесу) дожимаем,
                             # чтобы шлем успевал декодировать (0 = без потолка)
+# --- Раздельный интерфейс для VR: мир по полю зрения + панели отдельными плашками ---
+SPLIT_UI = "auto"           # "auto" = в матче при включённой камере игры; "on"; "off"
+WORLD_CROP_X = 0.80         # доля ширины мира, которую передаём (центр; края вне поля зрения)
+WORLD_CROP_Y = 0.0          # доля высоты мира, срезаемая сверху+снизу (0 = не резать)
+PANEL_SCALE = 0.85          # масштаб панелей интерфейса в атласе (меньше = легче кадр)
 # Классы окна: "Warcraft III" = классика 1.26-1.29; "OsWindow" = Reforged 1.32.
 # Порядок = приоритет. Сейчас классика первой (1.29 играбельна офлайн без логина);
 # для стрима Reforged поставь "OsWindow" первым.
@@ -92,6 +98,17 @@ class FrameHub:
         self.fps = 0.0
         self.source = "нет"
         self.clients = 0
+        self.layout = None            # текущая раскладка атласа (см. ui_layout)
+        self.layout_seq = 0
+        self._layout_key = None
+        self.paused = False           # пауза захвата (отладка/превью): держим последний кадр
+
+    def set_layout(self, lay):
+        key = json.dumps(lay, sort_keys=True)
+        if key != self._layout_key:
+            self._layout_key = key
+            self.layout = lay
+            self.layout_seq += 1
 
     def publish(self, jpeg, size):
         with self.cond:
@@ -109,6 +126,24 @@ class FrameHub:
 
 hub = FrameHub()
 audio = AudioHub(log=print)      # звук ПК -> /audio (WASAPI loopback)
+ui_layout = Layout(split=True, world_crop_x=WORLD_CROP_X, world_crop_y=WORLD_CROP_Y,
+                   panel_scale=PANEL_SCALE)
+ui_mode = {"split": SPLIT_UI}
+
+
+def _split_active(have_window):
+    """Резать ли кадр на мир+панели сейчас."""
+    if not have_window:
+        return False
+    m = ui_mode.get("split", "auto")
+    if m == "on":
+        return True
+    if m == "off":
+        return False
+    try:   # auto: только в матче (камера валидна) и при включённой камере игры
+        return bool(camsync._enabled and camsync._ph and camsync._camera_valid())
+    except Exception:
+        return False
 
 # --- управление мышью игры из VR-указателя ---
 MOUSEEVENTF = {"ldown": 0x0002, "lup": 0x0004, "rdown": 0x0008, "rup": 0x0010}
@@ -167,6 +202,8 @@ def capture_loop():
             t_start = time.time()
             if hub.clients <= 0:            # никто не смотрит стрим — простой
                 time.sleep(0.2); last_sample = None; continue
+            if hub.paused:
+                time.sleep(0.1); continue
             hwnd = find_game_window()
             region = window_client_rect(hwnd) if hwnd else None
             if region is None:
@@ -183,9 +220,14 @@ def capture_loop():
                 continue
 
             frame = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(shot.height, shot.width, 4)[:, :, :3]
-            if MAX_WIDTH and shot.width > MAX_WIDTH:
-                scale = MAX_WIDTH / shot.width
-                frame = cv2.resize(frame, (MAX_WIDTH, max(2, int(shot.height * scale))), interpolation=cv2.INTER_AREA)
+            # раздельный интерфейс: мир (по полю зрения) + панели -> один атлас
+            ui_layout.split = _split_active(hub.source.startswith("окно"))
+            frame, lay = ui_layout.pack(frame)
+            if MAX_WIDTH and frame.shape[1] > MAX_WIDTH:
+                scale = MAX_WIDTH / frame.shape[1]
+                frame = cv2.resize(frame, (MAX_WIDTH, max(2, int(frame.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+                lay = scale_layout(lay, scale)
+            hub.set_layout(lay)
 
             sample = frame[::24, ::24, 1].copy()
             if last_sample is not None and sample.shape == last_sample.shape \
@@ -251,10 +293,23 @@ class Handler(BaseHTTPRequestHandler):
                 "camsync": camsync.status(),
                 "audio": {"ok": audio.ok, "error": audio.error,
                           "device": audio.device_name, "rate": audio.rate},
+                "layout_seq": hub.layout_seq,
+                "split": bool(hub.layout and hub.layout.get("split")),
+                "uimode": ui_mode["split"], "crop_x": ui_layout.world_crop_x,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif route == "/layout":
+            lay = dict(hub.layout or {"win": [0, 0], "atlas": [0, 0], "split": False, "regions": {}})
+            lay["seq"] = hub.layout_seq
+            body = json.dumps(lay).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(body)
         elif route == "/audio":
@@ -330,6 +385,24 @@ class Handler(BaseHTTPRequestHandler):
             if hasattr(camsync, "set_camcfg"):
                 camsync.set_camcfg(payload.get("height"), payload.get("angle"))
             body = b"{}"
+        elif route == "/uimode":
+            m = payload.get("split")
+            if m in ("auto", "on", "off"):
+                ui_mode["split"] = m
+            if payload.get("pause") is not None:
+                hub.paused = bool(payload.get("pause"))
+            try:
+                if payload.get("crop_x") is not None:
+                    ui_layout.world_crop_x = min(1.0, max(0.3, float(payload["crop_x"])))
+                if payload.get("crop_y") is not None:
+                    ui_layout.world_crop_y = min(0.6, max(0.0, float(payload["crop_y"])))
+                if payload.get("panel_scale") is not None:
+                    ui_layout.panel_scale = min(1.5, max(0.3, float(payload["panel_scale"])))
+            except (TypeError, ValueError):
+                pass
+            body = json.dumps({"split": ui_mode["split"], "crop_x": ui_layout.world_crop_x,
+                               "crop_y": ui_layout.world_crop_y,
+                               "panel_scale": ui_layout.panel_scale}).encode()
         elif route == "/recenter":
             camsync.recenter()
             body = b"{}"
