@@ -140,10 +140,8 @@ def _split_active(have_window):
         return True
     if m == "off":
         return False
-    try:   # auto: только в матче (камера валидна) и при включённой камере игры
-        return bool(camsync._enabled and camsync._ph and camsync._camera_valid())
-    except Exception:
-        return False
+    # auto: флаг ведёт сам драйвер (поток захвата в память игры не лезет)
+    return bool(getattr(camsync, "in_match", False))
 
 # --- управление мышью игры из VR-указателя ---
 MOUSEEVENTF = {"ldown": 0x0002, "lup": 0x0004, "rdown": 0x0008, "rup": 0x0010}

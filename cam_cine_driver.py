@@ -29,6 +29,7 @@ CAM_OFF=0x254
 SETFIELD=GDLL_BASE+0x305a60            # FUN_6f305a60 (поле камеры)
 SETPOS=GDLL_BASE+0x3078b0              # FUN_6f3078b0 (позиция цели камеры x,y)
 VIEWBUILD=GDLL_BASE+0x3063d0           # FUN_6f3063d0 (покадровая сборка вида, главный поток)
+VIEWBUILD_ORIG=b"\x81\xEC\xB4\x00\x00\x00"   # её оригинальный пролог: sub esp,0xB4
 OFF_ROT=0x5b8; OFF_AOA=0x5b4; OFF_DIST=0x5b0
 OFF_TGTX=0x5a4; OFF_TGTY=0x5a8
 # границы цели камеры (прямоугольник карты), заполняются игрой:
@@ -95,6 +96,8 @@ class CineCameraSync:
         self._TGTX=None; self._TGTY=None; self._FARZ=None; self._ZOFF=None
         self._bnd=None                   # (minx,miny,maxx,maxy) цели камеры
         self._hook_orig=None             # оригинальные 6 байт пролога FUN_6f3063d0
+        self.in_match=False              # камера жива и управляется (читает сервер; без доступа к памяти)
+        self._attach_fails=0
         self._move=(0.0,0.0)             # стик джойстика (mx=вбок, my=вперёд/назад)
         self._move_s=(0.0,0.0)           # сглаженная скорость стика
         self._head=(0.0,0.0,0.0)         # смещение головы (вперёд, вправо, вверх), м
@@ -156,6 +159,7 @@ class CineCameraSync:
         if user32.GetForegroundWindow()!=h:
             user32.SetForegroundWindow(h)
     def _detach(self):
+        self.in_match=False
         try: self._uninstall_hook()
         except Exception: pass
         if self._ph:
@@ -295,9 +299,14 @@ class CineCameraSync:
         else:
             self._wf(ROT,self._neutral_rot_deg); self._wf(AOA,self._neutral_aoa_deg); self._wf(DIST,DIST_DEFAULT)
         # патч пролога FUN_6f3063d0: JMP cave (E9 rel32) + NOP -> ровно 6 байт
-        self._hook_orig=self._r(VIEWBUILD,6)
-        if not self._hook_orig or len(self._hook_orig)!=6:
+        cur=self._r(VIEWBUILD,6)
+        if not cur or len(cur)!=6:
             self._last_error="не прочитать пролог хука"; self._cave=None; return False
+        if cur!=VIEWBUILD_ORIG:
+            # пролог уже пропатчен (остался хук от прошлого сервера) — оригиналом
+            # считаем известные байты, иначе при снятии вернём чужой JMP
+            self.log("[cine] найден хук от прошлого запуска — переустанавливаю")
+        self._hook_orig=VIEWBUILD_ORIG
         patch=b"\xE9"+struct.pack("<i",cave-(VIEWBUILD+5))+b"\x90"
         if not self._patch_code(VIEWBUILD,patch):
             self._last_error="patch пролога fail"; self._cave=None; self._hook_orig=None; return False
@@ -429,6 +438,7 @@ class CineCameraSync:
             time.sleep(period)
             if not self._enabled:
                 if self._cave: self._wdw(self._ENABLE,0)
+                self.in_match=False
                 continue
             # процесс сменился (игру перезапустили) или закрылся -> переподключиться
             cur=self._find_pid()
@@ -438,7 +448,12 @@ class CineCameraSync:
                 self.log("[cine] игра перезапущена (pid %s->%s) — переподключаюсь"%(self._pid,cur))
                 self._detach()
             if self._ph is None:
-                if not self._attach(): time.sleep(1.0); continue
+                if not self._attach():
+                    self._attach_fails+=1
+                    if self._attach_fails in (3,30,300):
+                        self.log("[cine] не подключиться к игре (%s), попытка %d"%(self._last_error,self._attach_fails))
+                    time.sleep(1.0); continue
+                self._attach_fails=0
             if self._cave is None:
                 if not self._install_hook(): time.sleep(1.0); continue
             # держим окно активным, чтобы игра рендерила (не чаще раза в ~1с)
@@ -452,7 +467,8 @@ class CineCameraSync:
                 # не трогаем её (иначе гонка -> краш); при возврате валидной
                 # камеры заново привязываем глаз к её текущей цели
                 if not self._camera_valid():
-                    self._wdw(self._ENABLE,0); self._cam_ok=False; continue
+                    self._wdw(self._ENABLE,0); self._cam_ok=False; self.in_match=False; continue
+                self.in_match=True
                 if not getattr(self,'_cam_ok',False):
                     self.recenter(); self._cam_ok=True
             if time.time()-self._pose_time>1.0:
